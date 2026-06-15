@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import { env } from '../config/env';
 import { InboundMessage } from '../types';
 
-const GRAPH_API_VERSION = 'v20.0';
+const GRAPH_API_VERSION = 'v25.0';
 const GRAPH_BASE_URL = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
 
 /**
