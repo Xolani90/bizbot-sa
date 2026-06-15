@@ -4,8 +4,8 @@
  * Conversation pattern:
  *  1. Owner sends: "Book Thabo for haircut tomorrow at 2pm"
  *  2. Bot confirms: shows extracted details and asks to confirm
- *  3. Owner replies "yes" → booking created, customer upserted
- *  4. Reminder cron (crons/reminders.ts) fires 24h and 2h before
+ *  3. Owner replies YES → booking created, customer upserted
+ *  4. Reminder cron fires 24h and 2h before
  */
 
 import { supabase } from '../config/supabase';
@@ -13,8 +13,7 @@ import { sendTextMessage } from '../lib/whatsapp';
 import { Business, ConversationState } from '../types';
 import { parseNaturalDatetime } from '../lib/dateParser';
 import { getOrCreateConversationState, clearConversationState } from '../lib/conversationState';
-
-// ── Entry point ────────────────────────────────────────────────────────────
+import { checkBookingLimit } from '../lib/usageLimits';
 
 export async function handleBookingRequest(
   business: Business,
@@ -30,16 +29,25 @@ export async function handleBookingRequest(
   }
 }
 
-// ── Step 1: parse & confirm ────────────────────────────────────────────────
-
 async function beginBooking(
   business: Business,
   _text: string,
   entities: Record<string, unknown>
 ): Promise<void> {
+  // Check usage limits first
+  const limit = await checkBookingLimit(business);
+  if (!limit.allowed) {
+    await sendTextMessage(business.whatsapp_number, limit.message!);
+    return;
+  }
+
   const customerName = (entities.customer_name as string) || (entities.customer as string) || null;
   const serviceName = (entities.service as string) || null;
-  const rawDatetime = (entities.date as string) || (entities.time as string) || (entities.datetime as string) || null;
+  const rawDatetime =
+    (entities.date as string) ||
+    (entities.time as string) ||
+    (entities.datetime as string) ||
+    null;
 
   // Try to find matching service
   let serviceRow: { id: string; name: string; price: number; duration_minutes: number } | null = null;
@@ -62,12 +70,12 @@ async function beginBooking(
       business.whatsapp_number,
       `To book an appointment, tell me:\n\n` +
         `*Customer name*, *service*, and *date & time*\n\n` +
-        `Example: _"Book Thabo for haircut tomorrow at 2pm"_`
+        `Example: _"Book Thabo for haircut tomorrow at 2pm"_\n\n` +
+        `Or reply MENU for help.`
     );
     return;
   }
 
-  // Upsert conversation state with booking context
   await supabase
     .from('conversation_state')
     .upsert(
@@ -110,8 +118,6 @@ async function beginBooking(
   );
 }
 
-// ── Step 2: create booking after confirmation ──────────────────────────────
-
 async function confirmBooking(
   business: Business,
   state: ConversationState,
@@ -121,7 +127,7 @@ async function confirmBooking(
 
   if (normalised === 'NO' || normalised === 'CANCEL') {
     await clearConversationState(business.whatsapp_number, business.id);
-    await sendTextMessage(business.whatsapp_number, `Booking cancelled. No worries 👍`);
+    await sendTextMessage(business.whatsapp_number, `Booking cancelled. No worries 👍\n\nReply MENU any time.`);
     return;
   }
 
@@ -139,47 +145,38 @@ async function confirmBooking(
     scheduled_at: string;
   };
 
-  // Upsert customer
-  const { data: customer, error: custErr } = await supabase
+  // Find or create customer
+  let customerId: string | null = null;
+
+  // First try to find by name
+  const { data: existing } = await supabase
     .from('customers')
-    .upsert(
-      {
-        business_id: business.id,
-        whatsapp_number: business.whatsapp_number, // owner is proxy for now
-        name: ctx.customer_name,
-      },
-      { onConflict: 'business_id,whatsapp_number' }
-    )
     .select('id')
-    .single();
+    .eq('business_id', business.id)
+    .ilike('name', ctx.customer_name.trim())
+    .maybeSingle();
 
-  if (custErr || !customer) {
-    // Try to find existing
-    const { data: existing } = await supabase
+  if (existing) {
+    customerId = existing.id;
+  } else {
+    // Create new customer
+    const { data: newCustomer, error: createErr } = await supabase
       .from('customers')
+      .insert({
+        business_id: business.id,
+        whatsapp_number: `customer-${Date.now()}`, // placeholder — no phone known yet
+        name: ctx.customer_name,
+      })
       .select('id')
-      .eq('business_id', business.id)
-      .eq('name', ctx.customer_name)
-      .maybeSingle();
+      .single();
 
-    if (!existing) {
-      await sendTextMessage(business.whatsapp_number, `Sorry, something went wrong saving the customer. Please try again.`);
+    if (createErr || !newCustomer) {
+      console.error('[booking] Failed to create customer:', createErr);
+      await sendTextMessage(business.whatsapp_number, `Failed to save customer. Please try again.`);
+      await clearConversationState(business.whatsapp_number, business.id);
       return;
     }
-  }
-
-  const customerId = customer?.id ?? (
-    await supabase
-      .from('customers')
-      .select('id')
-      .eq('business_id', business.id)
-      .eq('name', ctx.customer_name)
-      .maybeSingle()
-  ).data?.id;
-
-  if (!customerId) {
-    await sendTextMessage(business.whatsapp_number, `Sorry, something went wrong. Please try again.`);
-    return;
+    customerId = newCustomer.id;
   }
 
   const { error: bookErr } = await supabase.from('bookings').insert({
@@ -192,13 +189,16 @@ async function confirmBooking(
   });
 
   if (bookErr) {
-    await sendTextMessage(business.whatsapp_number, `Sorry, failed to save the booking: ${bookErr.message}`);
+    console.error('[booking] Failed to insert booking:', bookErr);
+    await sendTextMessage(business.whatsapp_number, `Failed to save the booking: ${bookErr.message}\n\nPlease try again.`);
+    await clearConversationState(business.whatsapp_number, business.id);
     return;
   }
 
-  // Update customer visit count
-  // increment visit count (best effort)
-try { await supabase.rpc("increment_visit_count", { cust_id: customerId }); } catch {}
+  // Update visit count (best effort)
+  try {
+    await supabase.rpc('increment_visit_count', { cust_id: customerId });
+  } catch {}
 
   await clearConversationState(business.whatsapp_number, business.id);
 
@@ -216,6 +216,6 @@ try { await supabase.rpc("increment_visit_count", { cust_id: customerId }); } ca
     `✅ *Booking confirmed!*\n\n` +
       `${ctx.customer_name} — ${ctx.service_name}\n` +
       `📅 ${dateStr}\n\n` +
-      `I'll remind you 24h and 2h before.`
+      `I'll remind you 24h and 2h before. Reply MENU for more.`
   );
 }

@@ -12,33 +12,71 @@ import { getOrCreateConversationState } from '../lib/conversationState';
 import { Business, InboundMessage } from '../types';
 
 export async function routeMessage(message: InboundMessage): Promise<void> {
-  if (!message.text) {
-    await sendTextMessage(
-      message.from,
-      `For now I can only read text messages — please type your request and I'll take it from there 🙂`
-    );
-    return;
+  try {
+    if (!message.text) {
+      await sendTextMessage(
+        message.from,
+        `I can only read text messages for now — please type your request and I'll help you out 🙂`
+      );
+      return;
+    }
+
+    await logMessage(null, message.from, 'inbound', message.text, message.raw);
+
+    const business = await findBusinessByNumber(message.from);
+
+    if (!business) {
+      await startOnboarding(message.from);
+      return;
+    }
+
+    if (business.onboarding_status !== 'completed') {
+      await continueOnboarding(business, message.text);
+      return;
+    }
+
+    await handleOwnerMessage(business, message.text);
+  } catch (err) {
+    console.error('[router] Unhandled error processing message:', err);
+    // Best-effort reply — don't let errors go silent
+    try {
+      await sendTextMessage(
+        message.from,
+        `Sorry, something went wrong on my end. Please try again in a moment. If this keeps happening, reply MENU to reset.`
+      );
+    } catch {
+      // If even the error reply fails, just log it
+      console.error('[router] Failed to send error reply');
+    }
   }
-
-  await logMessage(null, message.from, 'inbound', message.text, message.raw);
-
-  const business = await findBusinessByNumber(message.from);
-
-  if (!business) {
-    await startOnboarding(message.from);
-    return;
-  }
-
-  if (business.onboarding_status !== 'completed') {
-    await continueOnboarding(business, message.text);
-    return;
-  }
-
-  await handleOwnerMessage(business, message.text);
 }
 
 async function handleOwnerMessage(business: Business, text: string): Promise<void> {
   const upper = text.trim().toUpperCase();
+
+  // Global reset command
+  if (upper === 'RESET' || upper === 'CANCEL') {
+    const { error } = await supabase
+      .from('conversation_state')
+      .update({ flow: 'idle', step: 'idle', context: {}, updated_at: new Date().toISOString() })
+      .eq('business_id', business.id)
+      .eq('whatsapp_number', business.whatsapp_number);
+    if (!error) {
+      await sendTextMessage(business.whatsapp_number, `✅ Conversation reset. Reply MENU to see what I can do.`);
+    }
+    return;
+  }
+
+  if (upper === 'UPGRADE') {
+    await sendTextMessage(
+      business.whatsapp_number,
+      `💎 *BizBot SA Plans*\n\n` +
+      `*Free* — 10 bookings, 5 invoices/month\n` +
+      `*Starter* — Unlimited everything — coming soon\n\n` +
+      `Stay tuned for Starter plan launch! Reply MENU for now.`
+    );
+    return;
+  }
 
   if (upper === 'MENU' || upper === 'HELP') {
     await handleGeneralQuery(business, text);
@@ -57,7 +95,15 @@ async function handleOwnerMessage(business: Business, text: string): Promise<voi
     return;
   }
 
-  const intent = await classifyIntent(text);
+  // Classify intent with Claude
+  let intent;
+  try {
+    intent = await classifyIntent(text);
+  } catch (err) {
+    console.error('[router] Intent classification failed:', err);
+    await handleGeneralQuery(business, text);
+    return;
+  }
 
   await logMessage(
     business.id,
@@ -77,35 +123,49 @@ async function routeToFlow(
   entities: Record<string, unknown>,
   _existingState: unknown
 ): Promise<void> {
-  switch (flow) {
-    case 'booking_request':
-    case 'booking':
-      await handleBookingRequest(business, text, entities);
-      break;
-    case 'quote_command':
-    case 'quote':
-      await handleQuoteCommand(business, text, entities);
-      break;
-    case 'invoice_command':
-    case 'invoice':
-      await handleInvoiceCommand(business, text, entities);
-      break;
-    case 'payment_record':
-      await handlePaymentRecord(business, text, entities);
-      break;
-    case 'expense_log':
-      await handleExpenseLog(business, text, entities);
-      break;
-    case 'marketing_request':
-      await handleMarketingRequest(business, text);
-      break;
-    case 'report_request':
-      await handleReportRequest(business);
-      break;
-    case 'general_query':
-    default:
-      await handleGeneralQuery(business, text);
-      break;
+  try {
+    switch (flow) {
+      case 'booking_request':
+      case 'booking':
+        await handleBookingRequest(business, text, entities);
+        break;
+      case 'quote_command':
+      case 'quote':
+        await handleQuoteCommand(business, text, entities);
+        break;
+      case 'invoice_command':
+      case 'invoice':
+        await handleInvoiceCommand(business, text, entities);
+        break;
+      case 'payment_record':
+        await handlePaymentRecord(business, text, entities);
+        break;
+      case 'expense_log':
+        await handleExpenseLog(business, text, entities);
+        break;
+      case 'marketing_request':
+        await handleMarketingRequest(business, text);
+        break;
+      case 'report_request':
+        await handleReportRequest(business);
+        break;
+      case 'general_query':
+      default:
+        await handleGeneralQuery(business, text);
+        break;
+    }
+  } catch (err) {
+    console.error(`[router] Error in flow "${flow}":`, err);
+    await sendTextMessage(
+      business.whatsapp_number,
+      `Something went wrong. Please try again, or reply MENU to start fresh.`
+    );
+    // Reset conversation state so user isn't stuck
+    await supabase
+      .from('conversation_state')
+      .update({ flow: 'idle', step: 'idle', context: {}, updated_at: new Date().toISOString() })
+      .eq('business_id', business.id)
+      .eq('whatsapp_number', business.whatsapp_number);
   }
 }
 
@@ -116,7 +176,10 @@ async function findBusinessByNumber(whatsappNumber: string): Promise<Business | 
     .eq('whatsapp_number', whatsappNumber)
     .maybeSingle();
 
-  if (error) throw error;
+  if (error) {
+    console.error('[router] Failed to look up business:', error);
+    throw error;
+  }
   return data as Business | null;
 }
 
@@ -135,5 +198,5 @@ async function logMessage(
     raw_payload: rawPayload,
   });
 
-  if (error) console.error('Failed to write messages_log row', error);
+  if (error) console.error('[router] Failed to write messages_log row:', error);
 }

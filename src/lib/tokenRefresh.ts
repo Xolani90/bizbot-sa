@@ -1,21 +1,17 @@
 /**
- * Token health check — logs a warning on startup if the WhatsApp token
- * looks like a temporary one (they start with "EAASE" and expire in 24h).
- * 
- * To fix permanently: create a System User token in Meta Business Manager:
- * business.facebook.com → Settings → System Users → Add → generate token
- * with whatsapp_business_messaging + whatsapp_business_management scopes.
- * System User tokens never expire.
+ * Token health check — logs the token type on startup.
+ * System User tokens from Meta Business Manager never expire.
+ * User tokens exchanged for long-lived ones last ~60 days.
  */
 export function warnIfTemporaryToken(token: string): void {
-  if (token.startsWith('EAASE') || token.startsWith('EAA')) {
+  // System User tokens start with a different pattern and are much longer
+  // All Meta tokens start with EAA — we just log which type we think it is
+  if (token.length < 150) {
     console.warn(
-      '[token] ⚠️  WARNING: WHATSAPP_TOKEN looks like a temporary user token (expires in 24h).\n' +
-      '[token]    Create a non-expiring System User token in Meta Business Manager:\n' +
-      '[token]    business.facebook.com → Settings → System Users → Add → Generate token\n' +
-      '[token]    Scopes needed: whatsapp_business_messaging, whatsapp_business_management'
+      '[token] ⚠️  Short token detected — may be a temporary token. ' +
+      'Consider creating a System User token in Meta Business Manager for a non-expiring token.'
     );
   } else {
-    console.log('[token] ✅ WhatsApp token looks like a System User token (non-expiring).');
+    console.log('[token] ✅ WhatsApp token loaded (long-lived or system user token).');
   }
 }

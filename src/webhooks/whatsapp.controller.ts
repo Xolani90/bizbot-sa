@@ -23,25 +23,30 @@ whatsappWebhookRouter.get('/', (req: Request, res: Response) => {
 });
 
 /**
- * Receives inbound WhatsApp messages and status updates (delivered/read
- * receipts). Responds 200 immediately — Meta retries aggressively on
- * slow or failed responses, and message processing involves AI + DB
- * round trips — then processes the message asynchronously.
+ * Receives inbound WhatsApp messages and status updates.
+ * Responds 200 immediately then processes asynchronously.
+ * 
+ * Signature verification is enforced when WHATSAPP_APP_SECRET is set.
+ * Set it in Render env vars to prevent spoofed webhook requests.
  */
 whatsappWebhookRouter.post('/', (req: Request, res: Response) => {
-  const signature = req.header('x-hub-signature-256');
-
-  if (!verifySignature(req.rawBody, signature)) {
-    res.sendStatus(401);
-    return;
+  // Enforce signature verification in production
+  if (env.whatsappAppSecret) {
+    const signature = req.header('x-hub-signature-256');
+    if (!verifySignature(req.rawBody, signature)) {
+      console.warn('[webhook] Rejected request with invalid signature');
+      res.sendStatus(401);
+      return;
+    }
   }
 
+  // Always respond 200 immediately — Meta retries aggressively on slow responses
   res.sendStatus(200);
 
   const message = parseInboundMessage(req.body);
   if (message) {
     routeMessage(message).catch((err) => {
-      console.error('Failed to process WhatsApp webhook message', err);
+      console.error('[webhook] Failed to process message:', err);
     });
   }
 });

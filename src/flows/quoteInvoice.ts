@@ -1,14 +1,11 @@
 /**
- * Quote / Invoice flow — handles quote_command and invoice_command intents.
- *
- * Quotes and invoices follow the same parsing path — the only difference
- * is the document type and whether a Yoco payment link is attached.
+ * Quote / Invoice flow.
  *
  * Conversation pattern:
  *  1. "Quote for Sipho — 2x tyres R850 each, labour R300"
- *  2. Bot parses line items via Claude Haiku, sends back a formatted preview
+ *  2. Bot parses line items, sends formatted preview
  *  3. Owner replies YES → PDF generated, sent as WhatsApp document
- *     (For invoices: also generates a Yoco payment link if configured)
+ *     (Invoices also get a Yoco payment link if configured)
  */
 
 import { supabase } from '../config/supabase';
@@ -19,8 +16,7 @@ import { parseLineItems, LineItem } from '../lib/lineItemParser';
 import { generateInvoicePdf } from '../lib/pdf';
 import { getOrCreateConversationState, clearConversationState } from '../lib/conversationState';
 import { generateYocoLink } from '../lib/yoco';
-
-// ── Entry points ──────────────────────────────────────────────────────────
+import { checkInvoiceLimit } from '../lib/usageLimits';
 
 export async function handleQuoteCommand(
   business: Business,
@@ -37,8 +33,6 @@ export async function handleInvoiceCommand(
 ): Promise<void> {
   await handleDocumentFlow(business, text, entities, 'invoice');
 }
-
-// ── Shared flow ────────────────────────────────────────────────────────────
 
 async function handleDocumentFlow(
   business: Business,
@@ -61,6 +55,15 @@ async function beginDocument(
   entities: Record<string, unknown>,
   docType: 'quote' | 'invoice'
 ): Promise<void> {
+  // Check usage limits for invoices
+  if (docType === 'invoice') {
+    const limit = await checkInvoiceLimit(business);
+    if (!limit.allowed) {
+      await sendTextMessage(business.whatsapp_number, limit.message!);
+      return;
+    }
+  }
+
   const customerName =
     (entities.customer_name as string) ||
     (entities.customer as string) ||
@@ -124,7 +127,7 @@ async function confirmDocument(
 
   if (normalised === 'NO' || normalised === 'CANCEL') {
     await clearConversationState(business.whatsapp_number, business.id);
-    await sendTextMessage(business.whatsapp_number, `${docType === 'quote' ? 'Quote' : 'Invoice'} cancelled.`);
+    await sendTextMessage(business.whatsapp_number, `${docType === 'quote' ? 'Quote' : 'Invoice'} cancelled. Reply MENU any time.`);
     return;
   }
 
@@ -140,90 +143,108 @@ async function confirmDocument(
     doc_type: 'quote' | 'invoice';
   };
 
-  // Upsert customer record
-  const { data: custData } = await supabase
+  // Find or create customer
+  let customerId: string | null = null;
+  const { data: existingCustomer } = await supabase
     .from('customers')
-    .upsert(
-      {
-        business_id: business.id,
-        whatsapp_number: business.whatsapp_number,
-        name: ctx.customer_name,
-      },
-      { onConflict: 'business_id,whatsapp_number' }
-    )
     .select('id')
+    .eq('business_id', business.id)
+    .ilike('name', ctx.customer_name.trim())
     .maybeSingle();
 
-  let customerId = custData?.id;
-  if (!customerId) {
-    const { data } = await supabase
+  if (existingCustomer) {
+    customerId = existingCustomer.id;
+  } else {
+    const { data: newCustomer } = await supabase
       .from('customers')
+      .insert({
+        business_id: business.id,
+        whatsapp_number: `customer-${Date.now()}`,
+        name: ctx.customer_name,
+      })
       .select('id')
-      .eq('business_id', business.id)
-      .ilike('name', ctx.customer_name)
-      .maybeSingle();
-    customerId = data?.id;
+      .single();
+    customerId = newCustomer?.id ?? null;
   }
 
-  // Generate invoice number
-  const invoiceNumber = await nextInvoiceNumber(business.id, docType);
+  // Generate document number (QT-0001 or INV-0001)
+  const docNumber = await nextDocNumber(business.id, docType);
 
-  // Save invoice/quote to DB
+  // Save to DB — 'number' is the correct column name per schema
   const { data: invoice, error: invErr } = await supabase
     .from('invoices')
     .insert({
       business_id: business.id,
-      customer_id: customerId || null,
-      invoice_number: invoiceNumber,
+      customer_id: customerId,
+      number: docNumber,
       line_items: ctx.items,
       subtotal: ctx.total,
       total: ctx.total,
       status: docType === 'quote' ? 'draft' : 'sent',
       due_date: docType === 'invoice' ? dueDateIn14Days() : null,
     })
-    .select('id, invoice_number')
+    .select('id, number')
     .single();
 
   if (invErr || !invoice) {
+    console.error('[quoteInvoice] Failed to save document:', invErr);
     await sendTextMessage(business.whatsapp_number, `Failed to save the ${docType}. Please try again.`);
+    await clearConversationState(business.whatsapp_number, business.id);
     return;
   }
 
   // Generate PDF
-  const pdfBuffer = await generateInvoicePdf({
-    docType,
-    invoiceNumber: invoice.invoice_number,
-    businessName: business.name || 'My Business',
-    customerName: ctx.customer_name,
-    items: ctx.items,
-    total: ctx.total,
-    dueDate: docType === 'invoice' ? dueDateIn14Days() : null,
-  });
+  let pdfBuffer: Buffer;
+  try {
+    pdfBuffer = await generateInvoicePdf({
+      docType,
+      invoiceNumber: invoice.number,
+      businessName: business.name || 'My Business',
+      customerName: ctx.customer_name,
+      items: ctx.items,
+      total: ctx.total,
+      dueDate: docType === 'invoice' ? dueDateIn14Days() : null,
+    });
+  } catch (pdfErr) {
+    console.error('[quoteInvoice] PDF generation failed:', pdfErr);
+    // Still confirm even if PDF fails
+    await clearConversationState(business.whatsapp_number, business.id);
+    await sendTextMessage(
+      business.whatsapp_number,
+      `✅ ${docType === 'quote' ? 'Quote' : 'Invoice'} *${invoice.number}* saved!\n\n` +
+        `Total: R${ctx.total.toFixed(2)}\n\n` +
+        `_(PDF generation failed — your ${docType} is saved in the system)_`
+    );
+    return;
+  }
 
   // Send PDF
-  await sendDocument(
-    business.whatsapp_number,
-    pdfBuffer,
-    `${docType}-${invoice.invoice_number}.pdf`,
-    `${docType === 'quote' ? 'Quote' : 'Invoice'} ${invoice.invoice_number} — R${ctx.total.toFixed(2)}`
-  );
+  try {
+    await sendDocument(
+      business.whatsapp_number,
+      pdfBuffer,
+      `${docType}-${invoice.number}.pdf`,
+      `${docType === 'quote' ? 'Quote' : 'Invoice'} ${invoice.number} — R${ctx.total.toFixed(2)}`
+    );
+  } catch (mediaErr) {
+    console.error('[quoteInvoice] PDF send failed:', mediaErr);
+    // Continue — still generate payment link and confirm
+  }
 
-  // If invoice and Yoco configured, generate payment link
+  // Yoco payment link for invoices
   if (docType === 'invoice' && business.yoco_merchant_id) {
     const paymentLink = await generateYocoLink({
       merchantId: business.yoco_merchant_id,
       amount: ctx.total,
-      description: `Invoice ${invoice.invoice_number} — ${business.name}`,
+      description: `Invoice ${invoice.number} — ${business.name}`,
       invoiceId: invoice.id,
     }).catch(() => null);
 
     if (paymentLink) {
       await sendTextMessage(
         business.whatsapp_number,
-        `💳 *Payment link:*\n${paymentLink}\n\nShare this link with ${ctx.customer_name} to accept card payments.`
+        `💳 *Payment link:*\n${paymentLink}\n\nShare this with ${ctx.customer_name} to accept card payments.`
       );
-
-      // Update invoice with payment link
       await supabase
         .from('invoices')
         .update({ payment_link: paymentLink })
@@ -235,19 +256,18 @@ async function confirmDocument(
 
   await sendTextMessage(
     business.whatsapp_number,
-    `✅ ${docType === 'quote' ? 'Quote' : 'Invoice'} *${invoice.invoice_number}* sent!\n\n` +
-      `Total: R${ctx.total.toFixed(2)}`
+    `✅ ${docType === 'quote' ? 'Quote' : 'Invoice'} *${invoice.number}* sent!\n\n` +
+      `Total: R${ctx.total.toFixed(2)}\n\n` +
+      `Reply MENU for more.`
   );
 }
-
-// ── Helpers ────────────────────────────────────────────────────────────────
 
 function extractCustomerFromText(text: string): string | null {
   const match = text.match(/(?:for|to)\s+([A-Za-z\s]+?)(?:\s*[-–—]|\s*,|\s*:)/i);
   return match ? match[1].trim() : null;
 }
 
-async function nextInvoiceNumber(businessId: string, docType: 'quote' | 'invoice'): Promise<string> {
+async function nextDocNumber(businessId: string, docType: 'quote' | 'invoice'): Promise<string> {
   const prefix = docType === 'quote' ? 'QT' : 'INV';
   const { count } = await supabase
     .from('invoices')
@@ -260,5 +280,5 @@ async function nextInvoiceNumber(businessId: string, docType: 'quote' | 'invoice
 function dueDateIn14Days(): string {
   const d = new Date();
   d.setDate(d.getDate() + 14);
-  return d.toISOString();
+  return d.toISOString().split('T')[0]; // date only
 }

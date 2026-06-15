@@ -17,6 +17,8 @@ export const env = {
   whatsappToken: required('WHATSAPP_TOKEN'),
   whatsappPhoneNumberId: required('WHATSAPP_PHONE_NUMBER_ID'),
   whatsappVerifyToken: required('WHATSAPP_VERIFY_TOKEN'),
+  // App secret for webhook signature verification — set this in Render env vars
+  // Get it from: developers.facebook.com → BizBot app → App settings → Basic → App Secret
   whatsappAppSecret: process.env.WHATSAPP_APP_SECRET ?? '',
 
   anthropicApiKey: required('ANTHROPIC_API_KEY'),
@@ -24,4 +26,6 @@ export const env = {
   yocoSecretKey: process.env.YOCO_SECRET_KEY ?? '',
 
   defaultTimezone: process.env.DEFAULT_TIMEZONE ?? 'Africa/Johannesburg',
+
+  nodeEnv: process.env.NODE_ENV ?? 'development',
 };
